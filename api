@@ -1,0 +1,168 @@
+from http.server import BaseHTTPRequestHandler
+import json
+import requests
+from datetime import datetime
+
+API_KEY = "ac0417c6e0dcfa236b146b9585892c9a"
+BASE_URL = "https://api-football-v1.p.rapidapi.com/v3"
+
+HEADERS = {
+    'x-rapidapi-host': 'api-football-v1.p.rapidapi.com',
+    'x-rapidapi-key': API_KEY
+}
+
+def calculate_enhanced_xg(stats):
+    xg = 0
+    possession = 50
+
+    for stat in stats:
+        stat_type = stat.get('type', '')
+        value = stat.get('value', 0)
+
+        try:
+            if isinstance(value, str):
+                if '%' in value:
+                    numeric_value = int(value.replace('%', ''))
+                    if stat_type == 'Ball Possession':
+                        possession = numeric_value
+                else:
+                    value = int(value)
+        except:
+            value = 0
+
+        xg_weights = {
+            'Shots on Goal': 0.35,
+            'Shots insidebox': 0.25,
+            'Total Shots': 0.08,
+            'Dangerous Attacks': 0.03,
+            'Corner Kicks': 0.05,
+        }
+
+        if stat_type in xg_weights:
+            xg += value * xg_weights[stat_type]
+
+    possession_bonus = (possession - 50) * 0.01
+    xg += possession_bonus
+
+    return max(0, round(xg, 2))
+
+def calculate_momentum_score(stats, minute):
+    score = 0
+
+    for stat in stats:
+        stat_type = stat.get('type', '')
+        value = stat.get('value', 0)
+
+        try:
+            if isinstance(value, str):
+                value = int(value.replace('%', ''))
+        except:
+            value = 0
+
+        weights = {
+            'Dangerous Attacks': 1.5,
+            'Shots on Goal': 2.0,
+            'Shots insidebox': 1.8,
+            'Corner Kicks': 0.8,
+            'Total Shots': 0.5
+        }
+
+        if stat_type in weights:
+            score += value * weights[stat_type]
+
+    if 15 <= minute <= 30:
+        multiplier = 1.2
+    elif 60 <= minute <= 75:
+        multiplier = 1.4
+    elif minute > 80:
+        multiplier = 1.6
+    else:
+        multiplier = 1.0
+
+    return round(score * multiplier, 2)
+
+class handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            url = f"{BASE_URL}/fixtures"
+            params = {'live': 'all'}
+
+            response = requests.get(url, headers=HEADERS, params=params, timeout=15)
+
+            if response.status_code == 200:
+                data = response.json()
+                matches = data.get('response', [])
+
+                results = []
+                for match in matches[:5]:
+                    fixture = match.get('fixture', {})
+                    teams = match.get('teams', {})
+                    goals = match.get('goals', {})
+                    league = match.get('league', {})
+
+                    match_info = {
+                        'id': fixture.get('id'),
+                        'league': league.get('name'),
+                        'country': league.get('country'),
+                        'home_team': teams.get('home', {}).get('name'),
+                        'away_team': teams.get('away', {}).get('name'),
+                        'home_goals': goals.get('home', 0),
+                        'away_goals': goals.get('away', 0),
+                        'minute': fixture.get('status', {}).get('elapsed', 0),
+                        'signals': []
+                    }
+
+                    stats_url = f"{BASE_URL}/fixtures/statistics"
+                    stats_params = {'fixture': fixture.get('id')}
+                    stats_response = requests.get(stats_url, headers=HEADERS, params=stats_params, timeout=10)
+
+                    if stats_response.status_code == 200:
+                        stats = stats_response.json().get('response', [])
+
+                        if len(stats) >= 2:
+                            home_xg = calculate_enhanced_xg(stats[0].get('statistics', []))
+                            away_xg = calculate_enhanced_xg(stats[1].get('statistics', []))
+                            minute = match_info['minute']
+
+                            match_info['home_xg'] = home_xg
+                            match_info['away_xg'] = away_xg
+                            match_info['total_xg'] = home_xg + away_xg
+
+                            if home_xg + away_xg > 10:
+                                match_info['signals'].append({
+                                    'market': 'Wysoka aktywność',
+                                    'confidence': min(85, int(60 + (home_xg + away_xg - 10) * 3)),
+                                    'reasoning': f'Total xG: {home_xg + away_xg:.1f}'
+                                })
+
+                    results.append(match_info)
+
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+
+                response_data = {
+                    'success': True,
+                    'timestamp': datetime.now().isoformat(),
+                    'matches_found': len(matches),
+                    'matches_analyzed': len(results),
+                    'results': results
+                }
+
+                self.wfile.write(json.dumps(response_data).encode())
+            else:
+                raise Exception(f"API error: {response.status_code}")
+
+        except Exception as e:
+            self.send_response(500)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+
+            error_response = {
+                'success': False,
+                'error': str(e)
+            }
+
+            self.wfile.write(json.dumps(error_response).encode())
